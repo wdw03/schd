@@ -8,13 +8,6 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# Global error handler
-@app.errorhandler(Exception)
-def handle_exception(e):
-    """Handle all unhandled exceptions"""
-    print(f"Unhandled exception: {e}")
-    return jsonify({"error": "Internal server error", "message": str(e)}), 500
-
 # ------------------ MongoDB Connection ------------------
 # MongoDB Connection using environment variable
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://savan:Kumar123@datasav.n8wcv70.mongodb.net/?retryWrites=true&w=majority&appName=datasav")
@@ -29,13 +22,31 @@ def get_db_connection():
     global client, db, collection
     if client is None:
         try:
-            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            print(f"Attempting MongoDB connection...")
+            # Increased timeout for better reliability
+            client = MongoClient(
+                MONGO_URI, 
+                serverSelectionTimeoutMS=10000,  # 10 seconds
+                connectTimeoutMS=10000,
+                socketTimeoutMS=30000,
+                retryWrites=True,
+                retryReads=True
+            )
             db = client["datasav"]
             collection = db["tests"]
-            # Test connection
+            # Quick connection test
+            print("Testing MongoDB connection...")
             client.admin.command('ping')
+            print("MongoDB connection successful!")
         except Exception as e:
-            print(f"MongoDB connection error: {e}")
+            error_msg = f"MongoDB connection error: {type(e).__name__}: {str(e)}"
+            print(error_msg)
+            # Reset on error
+            try:
+                if client:
+                    client.close()
+            except:
+                pass
             client = None
             db = None
             collection = None
@@ -50,25 +61,49 @@ def serialize(doc):
 def check_db_connection():
     """Check if database connection is available"""
     global client, db, collection
-    get_db_connection()  # This updates the global variables
-    if not client or not collection:
-        return False
     try:
+        get_db_connection()  # This updates the global variables
+        if not client or not collection:
+            print("MongoDB client or collection is None")
+            return False
+        # Test connection with ping
         client.admin.command('ping')
         return True
     except Exception as e:
-        print(f"DB ping failed: {e}")
+        print(f"DB connection check failed: {type(e).__name__}: {e}")
+        # Reset connection on failure
+        try:
+            if client:
+                client.close()
+        except:
+            pass
+        client = None
+        db = None
+        collection = None
         return False
 
 # ------------------ Health Check ------------------
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({
-        "status": "ok", 
-        "message": "API running with MongoDB",
-        "mongo_uri_set": bool(MONGO_URI),
-        "db_connected": check_db_connection()
-    })
+    try:
+        db_status = check_db_connection()
+        response = {
+            "status": "ok", 
+            "message": "API running with MongoDB",
+            "mongo_uri_set": bool(MONGO_URI),
+            "db_connected": db_status
+        }
+        if not db_status:
+            response["error"] = "MongoDB connection failed. Check network settings and connection string."
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "mongo_uri_set": bool(MONGO_URI),
+            "db_connected": False,
+            "error_type": type(e).__name__
+        }), 500
 
 # ------------------ GET ALL ------------------
 @app.route("/api/tests", methods=["GET"])
@@ -180,11 +215,27 @@ def delete_test(test_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ------------------ Global Error Handler ------------------
+from werkzeug.exceptions import HTTPException
+import traceback
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Handle HTTP exceptions"""
+    return jsonify({"error": e.name, "message": str(e.description)}), e.code
+
+@app.errorhandler(Exception)
+def handle_general_exception(e):
+    """Handle all other unhandled exceptions"""
+    print(f"Unhandled exception: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    return jsonify({"error": "Internal server error", "message": str(e)}), 500
+
 # ------------------ Export for Vercel ------------------
-# Export the app for Vercel serverless functions
-# Vercel Python expects 'handler' to be the WSGI application
+# Vercel Python serverless function handler
+# Export the Flask app as 'handler' for Vercel Python runtime
 handler = app
 
-# Alternative export (uncomment if above doesn't work):
-# def handler(request):
-#     return app(request.environ, request.start_response)
+# ------------------ Run Locally ------------------
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
