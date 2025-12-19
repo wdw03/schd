@@ -8,21 +8,38 @@ import os
 app = Flask(__name__)
 CORS(app)
 
+# Global error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Handle all unhandled exceptions"""
+    print(f"Unhandled exception: {e}")
+    return jsonify({"error": "Internal server error", "message": str(e)}), 500
+
 # ------------------ MongoDB Connection ------------------
 # MongoDB Connection using environment variable
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://savan:Kumar123@datasav.n8wcv70.mongodb.net/?retryWrites=true&w=majority&appName=datasav")
 
-try:
-    client = MongoClient(MONGO_URI)
-    # Test connection
-    client.admin.command('ping')
-    db = client["datasav"]
-    collection = db["tests"]
-except Exception as e:
-    print(f"MongoDB connection error: {e}")
-    client = None
-    db = None
-    collection = None
+# Initialize as None - will connect on first request (lazy connection for serverless)
+client = None
+db = None
+collection = None
+
+def get_db_connection():
+    """Get or create MongoDB connection (lazy initialization for serverless)"""
+    global client, db, collection
+    if client is None:
+        try:
+            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            db = client["datasav"]
+            collection = db["tests"]
+            # Test connection
+            client.admin.command('ping')
+        except Exception as e:
+            print(f"MongoDB connection error: {e}")
+            client = None
+            db = None
+            collection = None
+    return client, db, collection
 
 # ------------------ Helpers ------------------
 def serialize(doc):
@@ -32,18 +49,26 @@ def serialize(doc):
 
 def check_db_connection():
     """Check if database connection is available"""
+    global client, db, collection
+    get_db_connection()  # This updates the global variables
     if not client or not collection:
         return False
     try:
         client.admin.command('ping')
         return True
-    except:
+    except Exception as e:
+        print(f"DB ping failed: {e}")
         return False
 
 # ------------------ Health Check ------------------
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "ok", "message": "API running with MongoDB"})
+    return jsonify({
+        "status": "ok", 
+        "message": "API running with MongoDB",
+        "mongo_uri_set": bool(MONGO_URI),
+        "db_connected": check_db_connection()
+    })
 
 # ------------------ GET ALL ------------------
 @app.route("/api/tests", methods=["GET"])
@@ -157,4 +182,9 @@ def delete_test(test_id):
 
 # ------------------ Export for Vercel ------------------
 # Export the app for Vercel serverless functions
+# Vercel Python expects 'handler' to be the WSGI application
 handler = app
+
+# Alternative export (uncomment if above doesn't work):
+# def handler(request):
+#     return app(request.environ, request.start_response)
