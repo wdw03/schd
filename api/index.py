@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 import sqlite3
 import json
 import os
+import traceback
 from datetime import datetime
 
 # ------------------ App Setup ------------------
@@ -11,36 +13,40 @@ CORS(app)
 
 # ------------------ SQLite Database Setup ------------------
 # SQLite is a built-in database that comes with Python - no external setup needed!
-# For Vercel: Use /tmp directory for writable file system
-DB_FILE = os.getenv("DB_FILE", "/tmp/database.db" if os.getenv("VERCEL") else "database.db")
+# For Vercel: Use /tmp directory for writable file system (serverless requirement)
+VERCEL_ENV = os.getenv("VERCEL") or os.getenv("VERCEL_ENV")
+DB_FILE = os.getenv("DB_FILE", "/tmp/database.db" if VERCEL_ENV else "database.db")
+
+# Track if database is initialized
+_db_initialized = False
 
 def get_db():
-    """Get SQLite database connection"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # This allows accessing columns by name
-    return conn
-
-def init_db():
-    """Initialize database and create tables if they don't exist"""
-    conn = get_db()
-    cursor = conn.cursor()
+    """Get SQLite database connection and ensure database is initialized"""
+    global _db_initialized
     
-    # Create tests table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    print("Database initialized successfully!")
-
-# Initialize database on startup
-init_db()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        
+        # Initialize database on first connection (lazy initialization)
+        if not _db_initialized:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            _db_initialized = True
+            print(f"Database initialized successfully at {DB_FILE}")
+        
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {type(e).__name__}: {e}")
+        raise
 
 # ------------------ Helpers ------------------
 def serialize(row):
@@ -65,6 +71,8 @@ def check_db_connection():
         return True
     except Exception as e:
         print(f"DB connection check failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ------------------ Health Check ------------------
@@ -252,9 +260,6 @@ def delete_test(test_id):
         return jsonify({"error": str(e)}), 500
 
 # ------------------ Global Error Handler ------------------
-from werkzeug.exceptions import HTTPException
-import traceback
-
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
     """Handle HTTP exceptions"""
@@ -263,9 +268,15 @@ def handle_http_exception(e):
 @app.errorhandler(Exception)
 def handle_general_exception(e):
     """Handle all other unhandled exceptions"""
-    print(f"Unhandled exception: {type(e).__name__}: {e}")
+    error_type = type(e).__name__
+    error_msg = str(e)
+    print(f"Unhandled exception: {error_type}: {error_msg}")
     traceback.print_exc()
-    return jsonify({"error": "Internal server error", "message": str(e)}), 500
+    return jsonify({
+        "error": "Internal server error", 
+        "message": error_msg,
+        "type": error_type
+    }), 500
 
 # ------------------ Export for Vercel ------------------
 # Vercel Python serverless function handler
