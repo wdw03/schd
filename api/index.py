@@ -1,85 +1,70 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from pymongo import MongoClient
-from bson.objectid import ObjectId
+import sqlite3
+import json
 import os
+from datetime import datetime
 
 # ------------------ App Setup ------------------
 app = Flask(__name__)
 CORS(app)
 
-# ------------------ MongoDB Connection ------------------
-# MongoDB Connection using environment variable
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://savan:Kumar123@datasav.n8wcv70.mongodb.net/?retryWrites=true&w=majority&appName=datasav")
+# ------------------ SQLite Database Setup ------------------
+# SQLite is a built-in database that comes with Python - no external setup needed!
+# For Vercel: Use /tmp directory for writable file system
+DB_FILE = os.getenv("DB_FILE", "/tmp/database.db" if os.getenv("VERCEL") else "database.db")
 
-# Initialize as None - will connect on first request (lazy connection for serverless)
-client = None
-db = None
-collection = None
+def get_db():
+    """Get SQLite database connection"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row  # This allows accessing columns by name
+    return conn
 
-def get_db_connection():
-    """Get or create MongoDB connection (lazy initialization for serverless)"""
-    global client, db, collection
-    if client is None:
-        try:
-            print(f"Attempting MongoDB connection...")
-            # Increased timeout for better reliability
-            client = MongoClient(
-                MONGO_URI, 
-                serverSelectionTimeoutMS=10000,  # 10 seconds
-                connectTimeoutMS=10000,
-                socketTimeoutMS=30000,
-                retryWrites=True,
-                retryReads=True
-            )
-            db = client["datasav"]
-            collection = db["tests"]
-            # Quick connection test
-            print("Testing MongoDB connection...")
-            client.admin.command('ping')
-            print("MongoDB connection successful!")
-        except Exception as e:
-            error_msg = f"MongoDB connection error: {type(e).__name__}: {str(e)}"
-            print(error_msg)
-            # Reset on error
-            try:
-                if client:
-                    client.close()
-            except:
-                pass
-            client = None
-            db = None
-            collection = None
-    return client, db, collection
+def init_db():
+    """Initialize database and create tables if they don't exist"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Create tests table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("Database initialized successfully!")
+
+# Initialize database on startup
+init_db()
 
 # ------------------ Helpers ------------------
-def serialize(doc):
-    if doc and "_id" in doc:
-        doc["_id"] = str(doc["_id"])
-    return doc
+def serialize(row):
+    """Convert SQLite row to dictionary"""
+    if row is None:
+        return None
+    data = dict(row)
+    # Parse JSON data if it exists
+    if 'data' in data and isinstance(data['data'], str):
+        try:
+            data['data'] = json.loads(data['data'])
+        except:
+            pass
+    return data
 
 def check_db_connection():
     """Check if database connection is available"""
-    global client, db, collection
     try:
-        get_db_connection()  # This updates the global variables
-        if not client or not collection:
-            print("MongoDB client or collection is None")
-            return False
-        # Test connection with ping
-        client.admin.command('ping')
+        conn = get_db()
+        conn.execute('SELECT 1')
+        conn.close()
         return True
     except Exception as e:
         print(f"DB connection check failed: {type(e).__name__}: {e}")
-        # Reset connection on failure
-        try:
-            if client:
-                client.close()
-        except:
-            pass
-        client = None
-        db = None
-        collection = None
         return False
 
 # ------------------ Health Check ------------------
@@ -89,18 +74,18 @@ def index():
         db_status = check_db_connection()
         response = {
             "status": "ok", 
-            "message": "API running with MongoDB",
-            "mongo_uri_set": bool(MONGO_URI),
+            "message": "API running with SQLite database",
+            "database": "SQLite (built-in)",
+            "db_file": DB_FILE,
             "db_connected": db_status
         }
         if not db_status:
-            response["error"] = "MongoDB connection failed. Check network settings and connection string."
+            response["error"] = "Database connection failed."
         return jsonify(response)
     except Exception as e:
         return jsonify({
             "status": "error",
             "message": str(e),
-            "mongo_uri_set": bool(MONGO_URI),
             "db_connected": False,
             "error_type": type(e).__name__
         }), 500
@@ -111,34 +96,54 @@ def get_all_tests():
     if not check_db_connection():
         return jsonify({"error": "Database connection unavailable"}), 503
     
-    query = {}
-
-    if name := request.args.get("name"):
-        query["name"] = {"$regex": name, "$options": "i"}
-    if test_type := request.args.get("type"):
-        query["type"] = {"$regex": test_type, "$options": "i"}
-
     try:
-        tests = [serialize(t) for t in collection.find(query)]
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Get filter parameters
+        name_filter = request.args.get("name")
+        type_filter = request.args.get("type")
+        
+        # Build query
+        query = "SELECT * FROM tests WHERE 1=1"
+        params = []
+        
+        if name_filter:
+            query += " AND data LIKE ?"
+            params.append(f'%"{name_filter}"%')
+        
+        if type_filter:
+            query += " AND data LIKE ?"
+            params.append(f'%"type":"{type_filter}"%')
+        
+        query += " ORDER BY created_at DESC"
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        tests = [serialize(row) for row in rows]
         return jsonify(tests)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ------------------ GET ONE ------------------
-@app.route("/api/tests/<string:test_id>", methods=["GET"])
+@app.route("/api/tests/<int:test_id>", methods=["GET"])
 def get_test(test_id):
     if not check_db_connection():
         return jsonify({"error": "Database connection unavailable"}), 503
-    
-    if not ObjectId.is_valid(test_id):
-        return jsonify({"error": "Invalid ID"}), 400
 
     try:
-        test = collection.find_one({"_id": ObjectId(test_id)})
-        if not test:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tests WHERE id = ?", (test_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
             return jsonify({"error": "Test not found"}), 404
 
-        return jsonify(serialize(test))
+        return jsonify(serialize(row))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -152,66 +157,97 @@ def add_tests():
         return jsonify({"error": "JSON body required"}), 415
 
     payload = request.get_json()
+    ids = []
 
     try:
+        conn = get_db()
+        cursor = conn.cursor()
+        
         if isinstance(payload, list):
-            result = collection.insert_many(payload)
-            ids = [str(i) for i in result.inserted_ids]
+            # Insert multiple records
+            for item in payload:
+                data_json = json.dumps(item)
+                cursor.execute(
+                    "INSERT INTO tests (data, created_at, updated_at) VALUES (?, ?, ?)",
+                    (data_json, datetime.now(), datetime.now())
+                )
+                ids.append(cursor.lastrowid)
         elif isinstance(payload, dict):
-            result = collection.insert_one(payload)
-            ids = [str(result.inserted_id)]
+            # Insert single record
+            data_json = json.dumps(payload)
+            cursor.execute(
+                "INSERT INTO tests (data, created_at, updated_at) VALUES (?, ?, ?)",
+                (data_json, datetime.now(), datetime.now())
+            )
+            ids.append(cursor.lastrowid)
         else:
+            conn.close()
             return jsonify({"error": "Invalid payload format"}), 400
 
+        conn.commit()
+        conn.close()
         return jsonify({"inserted": len(ids), "ids": ids}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ------------------ UPDATE ------------------
-@app.route("/api/tests/<string:test_id>", methods=["PUT"])
+@app.route("/api/tests/<int:test_id>", methods=["PUT"])
 def update_test(test_id):
     if not check_db_connection():
         return jsonify({"error": "Database connection unavailable"}), 503
-    
-    if not ObjectId.is_valid(test_id):
-        return jsonify({"error": "Invalid ID"}), 400
 
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 415
 
-    updated_fields = request.get_json()
-    if not updated_fields:
+    updated_data = request.get_json()
+    if not updated_data:
         return jsonify({"error": "No data provided"}), 400
 
     try:
-        result = collection.update_one(
-            {"_id": ObjectId(test_id)},
-            {"$set": updated_fields}
-        )
-
-        if not result.matched_count:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Check if record exists
+        cursor.execute("SELECT id FROM tests WHERE id = ?", (test_id,))
+        if not cursor.fetchone():
+            conn.close()
             return jsonify({"error": "Test not found"}), 404
-
-        return jsonify({"message": "Updated successfully"})
+        
+        # Update record
+        data_json = json.dumps(updated_data)
+        cursor.execute(
+            "UPDATE tests SET data = ?, updated_at = ? WHERE id = ?",
+            (data_json, datetime.now(), test_id)
+        )
+        
+        conn.commit()
+        conn.close()
+        return jsonify({"message": "Updated successfully", "id": test_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ------------------ DELETE ------------------
-@app.route("/api/tests/<string:test_id>", methods=["DELETE"])
+@app.route("/api/tests/<int:test_id>", methods=["DELETE"])
 def delete_test(test_id):
     if not check_db_connection():
         return jsonify({"error": "Database connection unavailable"}), 503
-    
-    if not ObjectId.is_valid(test_id):
-        return jsonify({"error": "Invalid ID"}), 400
 
     try:
-        result = collection.delete_one({"_id": ObjectId(test_id)})
-
-        if not result.deleted_count:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Check if record exists
+        cursor.execute("SELECT id FROM tests WHERE id = ?", (test_id,))
+        if not cursor.fetchone():
+            conn.close()
             return jsonify({"error": "Test not found"}), 404
-
-        return jsonify({"message": "Deleted successfully"})
+        
+        # Delete record
+        cursor.execute("DELETE FROM tests WHERE id = ?", (test_id,))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"message": "Deleted successfully", "id": test_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
